@@ -13,13 +13,120 @@ local base64 = require "ngx.base64"
 local lrucache = require "resty.lrucache"   -- to introduce LRU lua memory caching 
 local lru, err = lrucache.new(1000)  -- allow up to 1000 items in the cache
 
+
+local kong_utils = require "kong.tools.utils"
+local uuid = kong_utils.uuid
+--local random_string = kong_utils.random_string
+local jwt_decoder = require "kong.plugins.jwt.jwt_parser"
+local kong = kong
+local AWS = require("resty.aws")
+local aws = AWS:new()
+
+local request_id
+
 if not lru then
     error("failed to create the cache: " .. (err or "unknown"))
 end
 
-local AWS = require("resty.aws")
--- or similarly
-local aws = AWS:new()
+local function connect_to_dynamodb(plugin_conf)
+  -- instantiate a service (optionally overriding the global config)
+  local my_creds = aws:Credentials {
+    accessKeyId = plugin_conf.accessKeyId,    -- captures the accessKeyId to connect with AWS services
+    secretAccessKey = plugin_conf.secretAccessKey,  -- captures the secretAccessKey to connect with AWS
+   }
+     aws.config.credentials = my_creds
+  local test_env = kong.request.get_header('x-pongotest-env')
+  -- if test_env and test_env == 'local-dev' then
+  --   return aws:DynamoDB {
+  --     region = region,
+  --     tls = false
+  --   }
+  -- end
+  return aws:DynamoDB {
+     region = plugin_conf.region
+  }
+end
+
+local function get_item_by_access_token(current_token, tablename, dynamodb)
+  local access_token_getitem = {
+     Key = {
+        id = {
+           S = current_token
+        }
+     },
+     TableName = tablename,
+     ReturnConsumedCapacity = "TOTAL"
+  }
+  local item, err = dynamodb:getItem(access_token_getitem) -- to check if the hashedvalue items already exist
+  kong.log.info("current token from db=", cjson.encode(item))
+  -- kong.log.inspect(err)
+
+  if err then
+     local error = "Error fetching refresh token from DynamoDB. Error=" .. tostring(err)
+     kong.log.err(error)
+     return nil, error
+  end
+
+  if (not item)  or (not item.body) then
+    kong.log.err("Error fetching refresh token from Database. Nil response from DynamoDB.")
+    return nil, "Error fetching refresh token from Database. Nil response from DynamoDB."
+  end
+
+  if item.status ~= 200 then
+    local error = "Error fetching access token from Database. Non 200 response code received. Status=" ..
+    (item.status or '') .. " . Reason=" .. (item.reason or '')
+    kong.log.err(error)
+    return nil, error
+  end
+  if not item.body.Item then 
+    kong.log.info("No Item returned in the body from Get operation. Send 404 back!. Response from dynamodb = ", cjson.encode(item.body))
+    return kong.response.exit(404, {message = "Item not found in the table!"})
+  else
+    kong.log.info("item returned form dyamodb = ",cjson.encode(item))
+    return item.body
+  end
+end
+
+
+local function get_hashedjwt_from_db(hashvalue, dynamodb)
+  local hashedvalue_getitem = {
+     Key = {
+        hashedvalue = {
+           S = hashvalue
+        }
+     },
+     TableName = "nosa-jwt-hashes",
+     ReturnConsumedCapacity = "TOTAL"
+  }
+  local item, err = dynamodb:getItem(hashedvalue_getitem) -- to check if the hashedvalue items already exist
+  kong.log.info("current token from db=", item)
+  -- kong.log.inspect(err)
+
+  if err then
+     local error = "Error fetching refresh token from DynamoDB. Error=" .. tostring(err)
+     kong.log.err(error)
+     return nil, error
+  end
+
+  if (not item)  or (not item.body) then
+     kong.log.err("Error fetching refresh token from Database. Nil response from DynamoDB.")
+     return nil, "Error fetching refresh token from Database. Nil response from DynamoDB."
+  end
+
+  if item.status ~= 200 then
+    local error = "Error fetching access token from Database. Non 200 response code received. Status=" ..
+    (item.status or '') .. " . Reason=" .. (item.reason or '')
+    kong.log.err(error)
+    return nil, error
+  end
+
+  if not item.body.Item then
+    return kong.response.exit(404, {message = "Item not found"})
+  else
+     return item.body.Item
+  end
+end
+
 
 local function connect_to_secretsmanager(plugin_conf)
   local my_creds
@@ -66,14 +173,15 @@ local dump = function(...)
 end
 
 local function getsecretfromaws(plugin_conf)
+  local secretvalue
   if (plugin_conf.accessKeyId) and (plugin_conf.secretAccessKey) then
     kong.log.info("accesskeyId and secretAccessKey found in config. accessKeyId = ", plugin_conf.accessKeyId, " secretAccessKey = ",plugin_conf.secretAccessKey, " region = ", plugin_conf.region)
   else
     kong.log.info("No accessKeyid and secretAccessKey in plugin config!")
   end
 
-   client_id_temp = kong.request.get_header("secretkey")
-  if (not client_id_temp) or (client_id_temp == "") then
+  local secretkey = kong.request.get_header("secretkey")
+  if (not secretkey) or (secretkey == "") then
     kong.log.err("incoming request does not have a secretkey specified in the header! Throwing 400 error")
     return kong.response.exit(400, {message = "Invalid Request. Does either not contain secretkey in the header or its invalid value!",})
   else
@@ -86,7 +194,7 @@ local function getsecretfromaws(plugin_conf)
     else                    -- AWS connection is successful
       kong.log.info("Successful connection to AWS SecretManager!!")
       local clientid_param = {
-        SecretId = client_id_temp,
+        SecretId = secretkey,
         VersionStage = "AWSCURRENT"
           }
       kong.log.info("paramters = ", cjson.encode(clientid_param))
@@ -99,12 +207,12 @@ local function getsecretfromaws(plugin_conf)
         return kong.response.exit(404, {message ="Specified Secret not found in AWS SecretsManager"})
       else    -- happy path scenario for successful AWS call
         kong.log.info("data received from AWS SecretManager = ",cjson.encode(id_data))
-        client_id_value = id_data.body.SecretString
+        secretvalue = id_data.body.SecretString
       end
     end   -- end to else condition when AWS connection is successful 
   end  -- end to else condition where client_id_arn and client_secret_arn are valid 
 
-    return client_id_value
+    return secretvalue
 end -- end of function getsecretfromaws
 
 
@@ -113,19 +221,48 @@ function plugin:access(plugin_conf)
 
   local requestpath = kong.request.get_path()  -- get the path on which request is sent
   kong.log.info("incoming request path = ", requestpath)
-
+  local access_token_response, tablename, dynamodb
   -- code below checks if the incoming requst is for AWS SM or AWS dynamodb service
 
   if plugin_conf.aws_service == "dynamodb" then
     kong.log.info("Request comes for dynamodb operation")
     -- TODO need to add logic to call dynamodb service here
+    tablename = kong.request.get_header("tablename")
+    kong.log.info("Table name = ",tablename)
+    if not tablename or (tablename == "") then 
+      return kong.response.exit(400, {message = "Table name missing in the request. Please correct it and retry!"})
+    end
+
+    --return kong.response.exit(502, {message = "Dynamodb still under construction!"})
+    dynamodb, err = connect_to_dynamodb(plugin_conf)
+      if err or (not dynamodb) then
+         kong.log.err("failed to connect to dynamodb", err)
+         return kong.response.exit(500, {message = "Failed to connect to dynamodb. Error: " .. err }) -- TODO: check why would this return nil. probably it has to exit with kong.response.exit()
+      else
+        kong.log.debug("Connected to dynamoDB successfully!")
+         --TODO Actual code logic goes here
+        if not kong.request.get_header("key") or (kong.request.get_header("key") == "") then 
+          kong.log.err("missing mandatory field key in the request. Throwing 400 error back to client!")
+          return kong.response.exit(400, {message = "Table key for lookup is missing from Request Header. Please correct it and try again!"})
+        end
+
+        access_token_response, err = get_item_by_access_token(kong.request.get_header("key"), tablename, dynamodb)
+        if err or (not access_token_response) then
+          kong.log.err("Error occured when trying to GET item from dynamodb. Error = ",err)
+          return kong.response.exit(500, {error = "API ran into an unexpected error. Please retry in sometime or call customer service!"})
+        elseif access_token_response.count == 0 then
+          kong.log.warn("access_token_response.body.count = ", access_token_response.count)
+          return kong.response.exit(404, {message = "No item found in the the table for specified key. Please try again with a different key! "})
+        else
+          return kong.response.exit(200, access_token_response.Item)
+        end
+      end
+
   elseif plugin_conf.aws_service == "secretsmanager" then
     kong.log.info("Request is not coming from AWS SM")
 
     local indexstart, indexend, ustart, uend 
     local secret_value, client_secret_temp    
-    local client_id_arn = plugin_conf.client_id_arn
-    local client_secret_arn = plugin_conf.client_secret_arn 
     secret_value = getsecretfromaws(plugin_conf)
     kong.log.info("secret value extracted from AWS SM = ",secret_value)
 
@@ -139,40 +276,7 @@ function plugin:access(plugin_conf)
     kong.log.warn("value of aws service not valid from enum list. Throw 400 error")
     return kong.response.exit(400, {message = "Invalid value of AWS Service ", plugin_conf.aws_service})
   end   -- end of if condition check on type of AWS service to be invoked
-
-
-  local function hashing(input)
-    kong.log.info("key to be hashed = ",input)
   
-    if (not input) or input == "" then
-      kong.log.err("invalid input value = ",input)
-      return nil
-    end
-    local hash = sha:new()
-    hash:update(input) -- returns true or false
-    local digest_mid = hash:final() -- to return the hashed value of assertion
-    local digest_base64 = base64.encode_base64url(digest_mid)
-    kong.log.info("hashed value of ",input," is ",digest_base64) -- check the final hashed value generated
-    return digest_base64
-  end 
-
-  local function getAuthorizationToken()
-    local authorization = kong.request.get_header("Authorization") -- token is passed as Authorization header
-    if not authorization or authorization == "" then
-      kong.log.err("Authorization header missing in request")
-      return kong.response.exit(401, {message = "Missing or invalid Credentials!"})
-    end
-
-    local lowercase_auth = authorization:lower()
-    local _, end_indx, _ = lowercase_auth:find("^%s*bearer%s+")
-    local access_token = string.sub(authorization, end_indx+1) -- to extract the value of opaque token from header by trimming off "bearer"
-    --kong.log.info("trimmed Authorization value =",access_token)
-    if (not access_token) or access_token == "" then
-      kong.log.err("trimmed access_token is nil!")
-      return nil
-    end
-    return access_token
-  end -- end of getAuthorizationToken method
 end 
 -- return plugin object
 return plugin
